@@ -83,7 +83,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [["🎮 ساخت روم بازی 🎮"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        f"سلام {user.first_name}!\nبه ربات بازی اسم و فامیل سرعتی خوش آمدی. برای شروع یک روم بساز.",
+        f"سلام {user.first_name}!\n"
+        "به ربات بازی اسم و فامیل سرعتی خوش آمدی.\n"
+        "برای شروع یک روم بساز یا با استفاده از لینک دعوت به یک روم ملحق شو.\n\n"
+        "برای خروج از بازی در هر زمان از دستور /leave استفاده کن.",
         reply_markup=reply_markup,
     )
 
@@ -140,7 +143,7 @@ async def select_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"⏱️ زمان هر راند: {time_limit} ثانیه\n"
         f"🏅 امتیاز نهایی: {selected_score}\n\n"
         f"این لینک را برای دوستت بفرست تا به بازی ملحق شود:\n{invite_link}\n\n"
-        f"برای متوقف کردن بازی در هر زمان از دستور /stop استفاده کن."
+        f"برای متوقف کردن بازی (فقط توسط سازنده) از /stop و برای خروج همه بازیکنان از /leave استفاده کنید."
     )
     logger.info(f"Room {room_id} created by {user.first_name} ({user.id}).")
     return ConversationHandler.END
@@ -166,7 +169,6 @@ async def join_room(update: Update, context: ContextTypes.DEFAULT_TYPE, room_id:
         await context.bot.send_message(
             chat_id=player_id, text=f"🎉 {user.first_name} به بازی پیوست! بازی شروع می‌شود..."
         )
-    # Give a moment for players to read the join message before starting
     await asyncio.sleep(2)
     await start_new_round(context, room_id)
 
@@ -177,7 +179,6 @@ async def cancel_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text("ساخت روم لغو شد.")
     return ConversationHandler.END
 
-# --- FEATURE 1 & 2: توابع جدید و اصلاح شده منطق بازی ---
 
 async def no_answer_in_time(context: ContextTypes.DEFAULT_TYPE, room_id: str):
     """Handles the case where no one answers in time."""
@@ -185,16 +186,15 @@ async def no_answer_in_time(context: ContextTypes.DEFAULT_TYPE, room_id: str):
         return
 
     room = game_rooms[room_id]
-    # Check if someone has answered in the meantime
-    if room["current_round"] and room["current_round"]["answered_by"] is None:
-        room["current_round"]["answered_by"] = "TIMEOUT" # Mark as timed out
+    if room.get("current_round") and room["current_round"].get("answered_by") is None:
+        room["current_round"]["answered_by"] = "TIMEOUT" 
         for player_id in room["players"]:
             try:
                 await context.bot.send_message(chat_id=player_id, text="⌛️ زمان تمام شد! هیچکس پاسخی نداد.\nآماده برای راند بعدی...")
             except Exception as e:
                 logger.error(f"Error sending timeout message to {player_id}: {e}")
 
-        await asyncio.sleep(3) # Short pause before the next round
+        await asyncio.sleep(3) 
         await start_new_round(context, room_id)
 
 
@@ -204,7 +204,10 @@ async def start_new_round(context: ContextTypes.DEFAULT_TYPE, room_id: str):
         
     room = game_rooms[room_id]
     
-    # Cancel any previous timer task
+    # Clean up protest info from the previous round
+    if "last_round_info" in room:
+        del room["last_round_info"]
+        
     if room.get("timer_task") and not room["timer_task"].done():
         room["timer_task"].cancel()
 
@@ -228,7 +231,7 @@ async def start_new_round(context: ContextTypes.DEFAULT_TYPE, room_id: str):
         "category_info": selected_category_info,
         "letter_info": selected_letter_info,
         "answered_by": None,
-        "round_id": str(uuid.uuid4()) # Unique ID for the round to avoid protest collision
+        "round_id": str(uuid.uuid4())
     }
     
     scores_text = "\n".join([f"👤 {p['name']}: {p['score']}" for p in room["players"].values()])
@@ -242,17 +245,20 @@ async def start_new_round(context: ContextTypes.DEFAULT_TYPE, room_id: str):
     for player_id, msg in countdown_messages.items():
          await msg.edit_text(text=message_text, parse_mode='Markdown')
 
-    # FEATURE 1: Start a countdown timer for answering
     time_limit = room["settings"]["time"]
-    # Schedule the no_answer_in_time function to be called after the time limit
-    timer_task = asyncio.create_task(
-        asyncio.sleep(time_limit, result=room_id)
+    job_name = f'timeout_{room_id}'
+    
+    # Remove any existing job with the same name
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+        
+    context.job_queue.run_once(
+        lambda ctx: asyncio.create_task(no_answer_in_time(ctx, room_id)),
+        time_limit,
+        name=job_name,
+        data={'room_id': room_id}
     )
-    # Add a callback to the task to execute the timeout function
-    timer_task.add_done_callback(
-        lambda t: asyncio.create_task(no_answer_in_time(context, t.result()))
-    )
-    room["timer_task"] = timer_task
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -268,14 +274,15 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
         
     room = game_rooms[active_room_id]
-    current_round = room["current_round"]
+    current_round = room.get("current_round")
     
     if not current_round or current_round.get("answered_by") is not None:
         return
 
-    # FEATURE 1: Cancel the timeout timer since an answer was given
-    if room.get("timer_task") and not room["timer_task"].done():
-        room["timer_task"].cancel()
+    job_name = f'timeout_{active_room_id}'
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
 
     letter_info = current_round["letter_info"]
     if answer.strip().startswith(letter_info["letter"]):
@@ -283,74 +290,81 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         category_info = current_round["category_info"]
         score_this_round = category_info["difficulty"] + letter_info["difficulty"]
-        current_round["last_score"] = score_this_round # Store score for potential protest
         room["players"][user.id]["score"] += score_this_round
         
+        # **FIX**: Store round info for potential protest
+        room["last_round_info"] = {
+            "round_id": current_round["round_id"],
+            "winner_id": user.id,
+            "score": score_this_round,
+            "answer": answer
+        }
+
         winner_name = room["players"][user.id]["name"]
-        
         announcement = f"✅ آفرین {winner_name}!\nجواب: *{answer}*\n\nشما *{score_this_round}* امتیاز گرفتی."
         
-        # FEATURE 2: Add protest button for the other player
         protest_button = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚖️ اعتراض دارم!", callback_data=f"protest_{active_room_id}_{current_round['round_id']}_{user.id}")
+            InlineKeyboardButton("⚖️ اعتراض دارم!", callback_data=f"protest_{active_room_id}_{current_round['round_id']}")
         ]])
         
         for player_id in room["players"]:
-            if player_id == user.id: # Winner's message
+            if player_id == user.id:
                 await context.bot.send_message(chat_id=player_id, text=announcement, parse_mode='Markdown')
-            else: # Loser's message with protest button
+            else:
                 await context.bot.send_message(chat_id=player_id, text=announcement, reply_markup=protest_button, parse_mode='Markdown')
 
         if room["players"][user.id]["score"] >= room["settings"]["score"]:
-            await end_game(context, active_room_id, f"برنده نهایی: {winner_name}")
+            await end_game(context, active_room_id, f"برنده نهایی {winner_name} است")
         else:
-            # FEATURE 2: Wait for 5 seconds to allow for protest
-            await asyncio.sleep(5) 
-            # Check if game is still running before starting new round
+            await asyncio.sleep(5)
             if game_rooms.get(active_room_id) and game_rooms[active_room_id]["status"] == "playing":
                 await start_new_round(context, active_room_id)
 
-# FEATURE 2: Callback for the protest button
+
 async def protest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("اعتراض شما ثبت شد!")
-
+    
     try:
-        _, room_id, round_id, winner_id_str = query.data.split("_")
-        winner_id = int(winner_id_str)
+        _, room_id, round_id_from_callback = query.data.split("_")
     except ValueError:
-        await query.edit_message_text("خطا در پردازش اعتراض.")
+        await query.answer("خطا در پردازش اعتراض.", show_alert=True)
         return
 
     if room_id not in game_rooms:
-        await query.edit_message_text("این بازی دیگر وجود ندارد.")
+        await query.answer("این بازی دیگر وجود ندارد.", show_alert=True)
         return
 
     room = game_rooms[room_id]
-    current_round = room.get("current_round", {})
+    last_round = room.get("last_round_info")
 
-    # Ensure protest is for the current round and points haven't been reverted
-    if current_round.get("round_id") == round_id and "last_score" in current_round:
-        score_to_revert = current_round.pop("last_score") # Use pop to prevent multiple protests
-        room["players"][winner_id]["score"] -= score_to_revert
+    if last_round and last_round["round_id"] == round_id_from_callback:
+        await query.answer("اعتراض شما ثبت شد!")
         
-        protester_name = query.from_user.first_name
+        winner_id = last_round["winner_id"]
+        score_to_revert = last_round["score"]
         winner_name = room["players"][winner_id]["name"]
+        protester_name = query.from_user.first_name
+        
+        room["players"][winner_id]["score"] -= score_to_revert
         
         protest_message = (
             f"❗️ **اعتراض ثبت شد!**\n\n"
-            f"{protester_name} به پاسخ {winner_name} اعتراض کرد.\n"
+            f"{protester_name} به پاسخ '{last_round['answer']}' اعتراض کرد.\n"
             f"{score_to_revert} امتیاز از {winner_name} کسر شد."
         )
         
-        # Remove the protest button from the message
-        await query.edit_message_text(text=query.message.text + f"\n\n*(اعتراض شما ثبت شد)*")
+        # Remove the protest button and update the message
+        await query.edit_message_text(text=query.message.text_markdown + f"\n\n*(⚖️ اعتراض توسط {protester_name} ثبت شد)*", parse_mode='Markdown')
 
         for player_id in room["players"]:
             await context.bot.send_message(chat_id=player_id, text=protest_message, parse_mode='Markdown')
+            
+        # Remove info to prevent double protest
+        del room["last_round_info"]
     else:
-        await query.edit_message_text("دیر شده! امکان اعتراض برای این راند وجود ندارد.")
-
+        await query.answer("فرصت اعتراض برای این راند تمام شده است.", show_alert=True)
+        # Optionally remove the button if the protest is too late
+        await query.edit_message_text(text=query.message.text_markdown + "\n\n*(فرصت اعتراض تمام شد)*", parse_mode='Markdown')
 
 async def end_game(context: ContextTypes.DEFAULT_TYPE, room_id: str, reason: str):
     if room_id not in game_rooms or game_rooms[room_id]["status"] == "finished":
@@ -359,9 +373,11 @@ async def end_game(context: ContextTypes.DEFAULT_TYPE, room_id: str, reason: str
     room = game_rooms[room_id]
     room["status"] = "finished"
 
-    # Cancel any running timer
-    if room.get("timer_task") and not room["timer_task"].done():
-        room["timer_task"].cancel()
+    # Cancel any running timer job
+    job_name = f'timeout_{room_id}'
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
 
     scores_text = "\n".join([f"👤 {p['name']}: {p['score']}" for p in room["players"].values()])
     final_message = (
@@ -377,48 +393,29 @@ async def end_game(context: ContextTypes.DEFAULT_TYPE, room_id: str, reason: str
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     try:
-        await context.bot.send_message(chat_id=creator_id, text="می‌خواهید دوباره بازی کنید؟", reply_markup=reply_markup)
+        if 'creator_id' in room and room['creator_id']:
+            await context.bot.send_message(chat_id=creator_id, text="می‌خواهید دوباره بازی کنید؟", reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Could not send restart message to creator {creator_id}: {e}")
     
-    # Optional: Clean up the room after some time
-    await asyncio.sleep(300) # 5 minutes
-    if room_id in game_rooms and game_rooms[room_id]["status"] == "finished":
+    # Clean up the room immediately
+    if room_id in game_rooms:
         del game_rooms[room_id]
-        logger.info(f"Room {room_id} cleaned up.")
+        logger.info(f"Room {room_id} finished and cleaned up.")
 
 
 async def restart_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    room_id = query.data.split("_")[1]
-    if room_id not in game_rooms:
-        await query.edit_message_text("این بازی دیگر وجود ندارد.")
-        return
-        
-    room = game_rooms[room_id]
-    # Re-add players who might have left
-    # This logic assumes players are still available. A more robust system might need re-invites.
-    
-    for player_id in list(room["players"].keys()):
-        room["players"][player_id]["score"] = 0
-        
-    room["status"] = "playing"
-    await query.edit_message_text("بازی در حال شروع مجدد است...")
-    
-    for player_id in room["players"]:
-        await context.bot.send_message(chat_id=player_id, text="🚀 بازی مجدداً شروع می‌شود!")
-
-    await asyncio.sleep(2)
-    await start_new_round(context, room_id)
+    await query.edit_message_text("این قابلیت در حال حاضر غیرفعال است.")
 
 
-# FEATURE 3: Stop game command
+# NEW: Stop game command (creator only)
 async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     active_room_id = None
     for room_id, room_data in game_rooms.items():
-        if user.id == room_data["creator_id"] and room_data["status"] == "playing":
+        if user.id == room_data.get("creator_id") and room_data.get("status") == "playing":
             active_room_id = room_id
             break
 
@@ -427,7 +424,27 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Creator {user.first_name} ({user.id}) stopped room {active_room_id}.")
-    await end_game(context, active_room_id, "بازی توسط سازنده متوقف شد.")
+    await end_game(context, active_room_id, "بازی توسط سازنده متوقف شد")
+
+
+# NEW: Leave game command (any player)
+async def leave_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    active_room_id = None
+    
+    for room_id, room_data in game_rooms.items():
+        if user.id in room_data.get("players", {}) and room_data.get("status") == "playing":
+            active_room_id = room_id
+            break
+
+    if not active_room_id:
+        await update.message.reply_text("شما در حال حاضر در هیچ بازی فعالی نیستید.")
+        return
+    
+    room = game_rooms[active_room_id]
+    leaver_name = room["players"][user.id]["name"]
+    logger.info(f"Player {leaver_name} ({user.id}) left room {active_room_id}.")
+    await end_game(context, active_room_id, f"بازیکن {leaver_name} از بازی خارج شد")
 
 
 def main() -> None:
@@ -450,10 +467,11 @@ def main() -> None:
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop_game)) # FEATURE 3
+    application.add_handler(CommandHandler("stop", stop_game))
+    application.add_handler(CommandHandler("leave", leave_game)) # NEW
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer))
     application.add_handler(CallbackQueryHandler(restart_game_callback, pattern="^restart_"))
-    application.add_handler(CallbackQueryHandler(protest_callback, pattern="^protest_")) # FEATURE 2
+    application.add_handler(CallbackQueryHandler(protest_callback, pattern="^protest_"))
     
     application.run_polling()
 
